@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "agentiscode"
+version = "0.1.0"
+description = "Unified CLI for coding agents with optional Agentis telemetry"
+authors = ["Agentis <info@agentis.cz>"]
+readme = "README.md"
+packages = [{ include = "agentiscode" }]
+
+[tool.poetry.scripts]
+agentiscode = "agentiscode.cli:main"
+
+[tool.poetry.dependencies]
+python = ">=3.13,<3.14"
+requests = "^2.33.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.2"
+ruff = "^0.14.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+pythonpath = "."
+testpaths = ["tests"]

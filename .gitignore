@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+agent-container
+agent-container/registry-secret.yaml
+agent-container/agdoc/
+agent-container/agentiscode-cli/
