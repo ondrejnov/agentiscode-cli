@@ -8,19 +8,52 @@ other executable; installing the adapter does not install this CLI.
 
 ## Installation
 
+`agentiscode` requires Python 3.13. The recommended installation uses
+[`pipx`](https://pipx.pypa.io/), which keeps the package in an isolated environment while making the command available
+outside the project's Poetry environment.
+
+From the repository root, install it for the current user:
+
+```bash
+pipx install --python python3.13 .
+pipx ensurepath
+agentiscode --help
+```
+
+Open a new shell after `pipx ensurepath`. If the command is still not found, add pipx's default binary directory to
+`PATH` explicitly:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add that export to the shell profile used by the processes that need `agentiscode` (for example `~/.profile`). Services
+and other non-interactive processes may not load a user shell profile; configure their `PATH` explicitly instead.
+
+To expose the command system-wide through `/usr/local/bin`, install it with a shared pipx location:
+
+```bash
+sudo env PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin \
+  pipx install --python "$(command -v python3.13)" .
+/usr/local/bin/agentiscode --help
+```
+
+The selected runtime executable must also be available in the target process's `PATH`: `opencode`, `claude`, or
+`claude-p`.
+
+For development, keep the Poetry-managed environment instead:
+
 ```bash
 poetry install
 poetry run agentiscode --help
 ```
 
-The selected runtime executable must also be available in `PATH`: `opencode`, `claude`, or `claude-p`.
-
 ## Usage
 
 ```bash
-poetry run agentiscode --adapter opencode --model openai/gpt-5 "fix the failing test"
-poetry run agentiscode --adapter claude --model claude-sonnet-4-5 "review the API"
-printf '%s' "continue the task" | poetry run agentiscode --adapter claude-p --resume SESSION_ID --json
+agentiscode --adapter opencode --model openai/gpt-5 "fix the failing test"
+agentiscode --adapter claude --model claude-sonnet-4-5 "review the API"
+printf '%s' "continue the task" | agentiscode --adapter claude-p --resume SESSION_ID --json
 ```
 
 Without `--json`, assistant text is written to stdout and activity is written to stderr. With `--json`, stdout is a
