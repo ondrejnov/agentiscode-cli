@@ -185,6 +185,36 @@ def test_telemetry_can_bind_secondary_session() -> None:
     }
 
 
+def test_telemetry_binds_title_and_parent_only_to_own_session() -> None:
+    client = FakeClient()
+    telemetry = AgentisTelemetry(
+        task_id="task-1",
+        prompt="udelej X",
+        adapter="claude",
+        run_id="run-existing",
+        primary_session=False,
+        session_title=" [Fix] fix:auth #7 ",
+        parent_session_id="ses-orchestrator",
+        client=client,
+    )
+
+    telemetry.start()
+    telemetry.handle(AgentEvent("session", {"session_id": "ses-agent"}))
+    telemetry.handle(AgentEvent("session", {"session_id": "ses-nested"}))
+
+    bindings = [call["params"] for call in client.calls if call["method"] == "run.store_session_id"]
+    assert bindings == [
+        {
+            "run_id": "run-existing",
+            "session_id": "ses-agent",
+            "primary": False,
+            "title": "[Fix] fix:auth #7",
+            "parent_session_id": "ses-orchestrator",
+        },
+        {"run_id": "run-existing", "session_id": "ses-nested", "primary": False},
+    ]
+
+
 def test_telemetry_stores_subagent_messages_under_its_own_session() -> None:
     client = FakeClient()
     telemetry = AgentisTelemetry(

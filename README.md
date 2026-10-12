@@ -59,6 +59,13 @@ printf '%s' "continue the task" | agentiscode --adapter claude-p --resume SESSIO
 Without `--json`, assistant text is written to stdout and activity is written to stderr. With `--json`, stdout is a
 stream of flattened JSON Lines objects such as `{"type":"text","text":"..."}`.
 
+Event types: `session`, `text`, `reasoning`, `tool` (`status` `running` → `completed`/`error`), `step` (per-turn
+usage), `api_retry` (Claude retrying an API call), `stderr`, `error`, and exactly one final `result`. For Claude the
+`result` also carries the final answer (`result`), `structured_output` (with `--json-schema`), `subtype`, `num_turns`,
+`duration_ms` and, on failure, `api_error_status` / `terminal_reason` / `errors`. A `result` with `"synthetic": true`
+was computed by the wrapper because the runtime did not emit one (crash, timeout); it is `is_error: true` whenever an
+`error` event preceded it.
+
 ## Options
 
 | Option | Purpose |
@@ -71,12 +78,17 @@ stream of flattened JSON Lines objects such as `{"type":"text","text":"..."}`.
 | `--resume SESSION_ID` | Resume an existing coding-agent session. |
 | `--timeout SECONDS` | Whole-run timeout; `0` means no timeout. |
 | `--json` | Emit normalized flattened JSON Lines on stdout. |
+| `--permission-mode MODE` | Claude only: pass `--permission-mode MODE` instead of the default `--dangerously-skip-permissions`. |
+| `--disallowed-tools LIST` | Claude only: comma-separated tools disallowed in addition to `AskUserQuestion` (merged into one `--disallowedTools`). |
+| `--extra-args-json JSON` | JSON array of strings appended verbatim to the runtime CLI arguments, e.g. `'["--json-schema","{...}"]'`. |
 | `--task-id TASK_ID` | Attach telemetry to an Agentis task and create a run unless `--run-id` is supplied. |
 | `--project-id PROJECT_ID` | Append Agentis project context to a new prompt; defaults to `AGENTIS_PROJECT_ID`. |
 | `--run-id RUN_ID` | Report into an existing Agentis run; requires `--task-id`. |
 | `--task-status STATUS_ID` | Status used by the optional final Agentis comment. |
 | `--last-message-to-comment` | Send the final assistant response as a primary Agentis comment. |
 | `--primary-session BOOL` | Mark the first session as primary; defaults to `true`. |
+| `--session-title TITLE` | Title of the agent's session shown in Agentis (e.g. the name of a workflow subagent). |
+| `--parent-session-id SESSION_ID` | Session the agent's session belongs under in Agentis (e.g. the orchestrator that started it). |
 | `--agentis-api URL` | Agentis JSON-RPC endpoint; defaults to `AGENTIS_ENDPOINT`. |
 | `--agentis-token TOKEN` | User token; defaults to `AGENTIS_API_TOKEN`, then `AGENTIS_TOKEN`. |
 | `--agentis-service-token TOKEN` | Service callback token; defaults to `AGENTIS_SERVICE_TOKEN`. |

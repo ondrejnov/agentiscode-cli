@@ -110,6 +110,8 @@ class AgentisTelemetry:
         task_status: Optional[int] = None,
         last_message_to_comment: bool = False,
         primary_session: bool = True,
+        session_title: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         endpoint: Optional[str] = None,
         token: Optional[str] = None,
         service_token: Optional[str] = None,
@@ -129,6 +131,8 @@ class AgentisTelemetry:
         self.task_status = task_status
         self.last_message_to_comment = last_message_to_comment
         self.primary_session = primary_session
+        self.session_title = (session_title or "").strip() or None
+        self.parent_session_id = (parent_session_id or "").strip() or None
         self._on_error = on_error or (lambda message: None)
 
         self._client = client
@@ -299,10 +303,14 @@ class AgentisTelemetry:
     def _bind_session(self, session_id: str, state: _SessionTelemetryState, *, primary: bool) -> None:
         # Agentis hledá run podle session_id, takže binding musí proběhnout dřív,
         # než dává smysl posílat `session.store_activity_log`.
-        state.bound = self._call_succeeded(
-            "run.store_session_id",
-            {"run_id": self.run_id, "session_id": session_id, "primary": primary},
-        )
+        params: dict[str, Any] = {"run_id": self.run_id, "session_id": session_id, "primary": primary}
+        # Titulek a rodič patří jen hlavní session tohoto běhu (ne vnořeným subagentům uvnitř ní).
+        if session_id == self.session_id:
+            if self.session_title:
+                params["title"] = self.session_title
+            if self.parent_session_id:
+                params["parent_session_id"] = self.parent_session_id
+        state.bound = self._call_succeeded("run.store_session_id", params)
         if state.bound and state.dirty:
             self._push_activity_log(session_id, state)
 

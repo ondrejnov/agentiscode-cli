@@ -213,6 +213,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=0.0, help="Časový limit běhu v sekundách (0 = bez limitu).")
     parser.add_argument("--json", action="store_true", help="Streamuj sjednocené eventy jako JSON Lines na stdout.")
     parser.add_argument(
+        "--permission-mode",
+        metavar="MODE",
+        help="Claude: --permission-mode (místo výchozího --dangerously-skip-permissions).",
+    )
+    parser.add_argument(
+        "--disallowed-tools",
+        metavar="LIST",
+        help="Claude: nástroje zakázané navíc k AskUserQuestion (oddělené čárkou).",
+    )
+    parser.add_argument(
+        "--extra-args-json",
+        metavar="JSON",
+        type=_parse_json_args,
+        default=[],
+        help='Další argumenty předané přímo runtime CLI jako JSON pole řetězců, např. \'["--json-schema", "{...}"]\'.',
+    )
+    parser.add_argument(
         "--task-id",
         metavar="TASK_ID",
         help="Agentis task id — založí k němu run a průběžně do něj posílá aktivitu (telemetrie).",
@@ -245,6 +262,16 @@ def _parser() -> argparse.ArgumentParser:
         default=True,
         metavar="BOOL",
         help="Označ agent session jako primární v Agentisu (true/false, default: true).",
+    )
+    parser.add_argument(
+        "--session-title",
+        metavar="TITLE",
+        help="Titulek session zobrazený v Agentisu (např. jméno subagenta workflow).",
+    )
+    parser.add_argument(
+        "--parent-session-id",
+        metavar="SESSION_ID",
+        help="Session, pod kterou tato session v Agentisu patří (např. session orchestrátoru, který agenta spustil).",
     )
     parser.add_argument(
         "--agentis-api",
@@ -299,6 +326,16 @@ def _append_context_ids(prompt: str, task_id: Optional[str], project_id: Optiona
     if not tags:
         return prompt
     return f"{prompt.rstrip()}\n\n" + "\n".join(tags)
+
+
+def _parse_json_args(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"neplatný JSON: {exc}") from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise argparse.ArgumentTypeError("očekávám JSON pole řetězců")
+    return parsed
 
 
 def _parse_bool(value: str) -> bool:
@@ -429,6 +466,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         cwd=cwd,
         resume_session_id=args.resume,
         timeout_sec=args.timeout,
+        extra_args=args.extra_args_json,
+        permission_mode=args.permission_mode,
+        disallowed_tools=[t for t in (args.disallowed_tools or "").split(",") if t.strip()],
     )
 
     telemetry: Optional[AgentisTelemetry] = None
@@ -451,6 +491,8 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             task_status=args.task_status,
             last_message_to_comment=args.last_message_to_comment,
             primary_session=args.primary_session,
+            session_title=args.session_title,
+            parent_session_id=args.parent_session_id,
             endpoint=args.agentis_api,
             token=args.agentis_token,
             service_token=args.agentis_service_token,

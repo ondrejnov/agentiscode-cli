@@ -575,6 +575,61 @@ def test_cli_primary_session_false_drives_telemetry(monkeypatch) -> None:
     assert events["kwargs"]["primary_session"] is False
 
 
+def test_cli_session_title_and_parent_drive_telemetry(monkeypatch) -> None:
+    lines = [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": "ses_1",
+                "part": {"id": "p1", "messageID": "m1", "type": "text", "text": "Hello"},
+            }
+        )
+        + "\n",
+    ]
+    monkeypatch.setattr("agentiscode.runners.opencode.asyncio.create_subprocess_exec", _fake_subprocess(lines))
+
+    events: dict[str, Any] = {"kwargs": None}
+
+    class FakeTelemetry:
+        def __init__(self, **kwargs: Any) -> None:
+            events["kwargs"] = kwargs
+
+        def start(self) -> str:
+            return "run-1"
+
+        def handle(self, event: AgentEvent) -> None:
+            return None
+
+        def finish(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("agentiscode.cli.AgentisTelemetry", FakeTelemetry)
+
+    exit_code = run(
+        [
+            "--adapter",
+            "opencode",
+            "--task-id",
+            "task-1",
+            "--agentis-api",
+            "http://agentis.local/api",
+            "--session-title",
+            "[Scan] scan #1",
+            "--parent-session-id",
+            "ses-parent",
+            "udelej",
+            "X",
+        ]
+    )
+
+    assert exit_code == 0
+    assert events["kwargs"]["session_title"] == "[Scan] scan #1"
+    assert events["kwargs"]["parent_session_id"] == "ses-parent"
+
+
 def test_cli_last_message_to_comment_enables_final_comment(monkeypatch) -> None:
     lines = [
         json.dumps(
@@ -720,3 +775,115 @@ def test_parser_keeps_workflow_and_agentis_options() -> None:
     assert args.primary_session is False
     assert args.final_output == "/tmp/final.md"
     assert args.session_output == "/tmp/session-id"
+
+
+# ---------------------------------------------------------------------------
+# Passthrough argumentů a bohatší `result` (pro orchestrátory typu ultracode)
+# ---------------------------------------------------------------------------
+
+
+def test_claude_build_args_permission_mode_and_disallowed_tools() -> None:
+    from agentiscode.runners.claude import ClaudeRunConfig
+
+    args = ClaudeRunConfig(
+        permission_mode="dontAsk",
+        disallowed_tools=["Workflow", "AskUserQuestion", " "],
+        extra_args=["--json-schema", "{}"],
+    ).build_args()
+
+    assert "--dangerously-skip-permissions" not in args
+    assert args[args.index("--permission-mode") + 1] == "dontAsk"
+    assert args.count("--disallowedTools") == 1
+    assert args[args.index("--disallowedTools") + 1] == "AskUserQuestion,Workflow"
+    assert args[-2:] == ["--json-schema", "{}"]
+
+
+def test_cli_passes_extra_args_permission_mode_and_disallowed_tools(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run(config: AgentConfig, prompt: str, *_args: Any) -> int:
+        captured["config"] = config
+        return 0
+
+    monkeypatch.setattr("agentiscode.cli._run", fake_run)
+
+    exit_code = run(
+        [
+            "--adapter",
+            "claude",
+            "--permission-mode",
+            "acceptEdits",
+            "--disallowed-tools",
+            "Workflow,Bash",
+            "--extra-args-json",
+            '["--no-session-persistence", "--json-schema", "{\\"type\\":\\"object\\"}"]',
+            "udelej X",
+        ]
+    )
+
+    assert exit_code == 0
+    config = captured["config"]
+    assert config.permission_mode == "acceptEdits"
+    assert list(config.disallowed_tools) == ["Workflow", "Bash"]
+    assert list(config.extra_args) == ["--no-session-persistence", "--json-schema", '{"type":"object"}']
+
+
+def test_cli_rejects_invalid_extra_args_json() -> None:
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["--adapter", "claude", "--extra-args-json", '{"a": 1}'])
+
+
+def test_claude_result_carries_text_structured_output_and_error_detail(monkeypatch) -> None:
+    lines = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s1", "model": "claude-x"}) + "\n",
+        json.dumps({"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10, "error_status": 529})
+        + "\n",
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "s1",
+                "is_error": False,
+                "num_turns": 2,
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "total_cost_usd": 0.01,
+                "result": '{"a":1}',
+                "structured_output": {"a": 1},
+                "api_error_status": None,
+            }
+        )
+        + "\n",
+    ]
+    monkeypatch.setattr("agentiscode.runners.claude.asyncio.create_subprocess_exec", _fake_subprocess(lines))
+
+    async def collect() -> list[AgentEvent]:
+        wrapper = AgentWrapper(AgentConfig(adapter="claude", cwd="/w"))
+        return [event async for event in wrapper.stream("Do X")]
+
+    events = asyncio.run(collect())
+    assert [e.type for e in events] == ["session", "api_retry", "result"]
+    assert events[1].data == {"attempt": 1, "max_retries": 10, "error_status": 529}
+    result = events[-1].data
+    assert result["result"] == '{"a":1}'
+    assert result["structured_output"] == {"a": 1}
+    assert result["subtype"] == "success"
+    assert result["num_turns"] == 2
+    assert "api_error_status" not in result
+    assert "synthetic" not in result
+
+
+def test_claude_crash_without_result_yields_synthetic_error_result(monkeypatch) -> None:
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> _FakeProcess:
+        return _FakeProcess(stdout_lines=[], stderr_lines=["boom\n"], returncode=1)
+
+    monkeypatch.setattr("agentiscode.runners.claude.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect() -> list[AgentEvent]:
+        wrapper = AgentWrapper(AgentConfig(adapter="claude", cwd="/w"))
+        return [event async for event in wrapper.stream("Do X")]
+
+    events = asyncio.run(collect())
+    assert [e.type for e in events] == ["stderr", "error", "result"]
+    assert events[1].data["exit_code"] == 1
+    assert events[-1].data["is_error"] is True
+    assert events[-1].data["synthetic"] is True

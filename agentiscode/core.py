@@ -116,6 +116,10 @@ class AgentConfig:
     timeout_sec: float = 0.0
     extra_args: Sequence[str] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
+    # Jen Claude: `--permission-mode` (místo `--dangerously-skip-permissions`)
+    # a nástroje zakázané navíc k `AskUserQuestion`.
+    permission_mode: Optional[str] = None
+    disallowed_tools: Sequence[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -242,17 +246,27 @@ class _ClaudeTranslator:
                 )
             ]
         if t == "result":
-            return [
-                AgentEvent(
-                    "result",
-                    {
-                        "session_id": d.get("session_id"),
-                        "usage": d.get("usage"),
-                        "cost_usd": d.get("cost_usd"),
-                        "is_error": bool(d.get("is_error")),
-                    },
-                )
-            ]
+            payload: Dict[str, Any] = {
+                "session_id": d.get("session_id"),
+                "usage": d.get("usage"),
+                "cost_usd": d.get("cost_usd"),
+                "is_error": bool(d.get("is_error")),
+                # Finální odpověď a detail ukončení (kvůli konzumentům, kteří
+                # potřebují výsledek/strukturovaný výstup a klasifikaci chyb).
+                "result": d.get("summary"),
+            }
+            for key in (
+                "subtype",
+                "structured_output",
+                "num_turns",
+                "duration_ms",
+                "api_error_status",
+                "terminal_reason",
+                "errors",
+            ):
+                if d.get(key) is not None:
+                    payload[key] = d.get(key)
+            return [AgentEvent("result", payload)]
         if t == "assistant_message":
             # Každá assistant zpráva nese vlastní `usage` toho turnu → vydáme
             # per-turn `step`, ať jde sčítat napříč turny (text/tool bloky už
@@ -268,10 +282,29 @@ class _ClaudeTranslator:
                 self._steps_seen.add(msg_id)
             return [AgentEvent("step", _with_msg_id({"usage": dict(usage), "cost_usd": None}, msg_id))]
         if t == "error":
-            return [AgentEvent("error", {"message": d.get("message")})]
+            payload = {"message": d.get("message")}
+            for key in ("exit_code", "stderr"):
+                if d.get(key) is not None:
+                    payload[key] = d.get(key)
+            return [AgentEvent("error", payload)]
         if t == "stderr":
             return [AgentEvent("stderr", {"line": d.get("line")})]
-        # user_message / raw — vše podstatné už máme z dílčích eventů.
+        if t == "raw":
+            ev = d.get("event")
+            if isinstance(ev, dict) and ev.get("type") == "system" and ev.get("subtype") == "api_retry":
+                # Claude sám opakuje API volání — pro konzumenty je to známka života.
+                return [
+                    AgentEvent(
+                        "api_retry",
+                        {
+                            key: ev.get(key)
+                            for key in ("attempt", "max_retries", "retry_delay_ms", "error_status", "error")
+                            if ev.get(key) is not None
+                        },
+                    )
+                ]
+            return []
+        # user_message — vše podstatné už máme z dílčích eventů.
         return []
 
 
@@ -483,6 +516,8 @@ class AgentWrapper:
                 extra_args=cfg.extra_args,
                 env=env,
                 timeout_sec=cfg.timeout_sec,
+                permission_mode=cfg.permission_mode,
+                disallowed_tools=cfg.disallowed_tools,
             )
         )
 
@@ -495,8 +530,11 @@ class AgentWrapper:
         on_proc_started: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
     ) -> AsyncIterator[AgentEvent]:
         emitted_result = False
+        saw_error = False
         async for native in self._runner.stream(prompt, on_proc_started=on_proc_started):
             for unified in self._translate(native):
+                if unified.type == "error":
+                    saw_error = True
                 if self.adapter == OPENCODE:
                     session_id = native.session_id or self._runner.session_id
                     if session_id:
@@ -512,7 +550,9 @@ class AgentWrapper:
                     "session_id": self._runner.session_id,
                     "usage": self._runner.last_usage,
                     "cost_usd": self._runner.last_cost_usd,
-                    "is_error": getattr(self._runner, "last_error", None) is not None,
+                    "is_error": saw_error or getattr(self._runner, "last_error", None) is not None,
+                    # Runtime nevydal vlastní `result` (pád, timeout, …) — dopočítaný.
+                    "synthetic": True,
                 },
             )
 

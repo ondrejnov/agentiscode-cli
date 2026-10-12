@@ -27,6 +27,7 @@ import json
 import os
 import signal
 import shlex
+import sys
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
 
@@ -38,6 +39,24 @@ from agentiscode.stream_reader import unbounded_line_reader as _unbounded_line_r
 # Po terminálním `result` eventu necháme claude CLI doběhnout jen krátce; pokud
 # stdout neuzavře a sám neskončí, tvrdě ho ukončíme.
 _PROC_EXIT_GRACE_SEC = 10.0
+
+
+def _set_parent_death_signal() -> None:
+    """Linux: claude dostane SIGKILL, když umře náš proces (i tvrdým SIGKILL).
+
+    Claude běží ve vlastní process group (``start_new_session``), takže kill
+    skupiny wrapperu ho nezasáhne — bez tohohle by po SIGKILL wrapperu zůstal
+    viset jako sirotek. Best-effort: mimo Linux nebo bez libc se nic neděje.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +91,12 @@ class ClaudeRunConfig:
     effort: Optional[str] = None  # např. "low" | "medium" | "high"
     max_turns: Optional[int] = None
     dangerously_skip_permissions: bool = True
+    # Explicitní permission mode (`--permission-mode`); má přednost před
+    # `--dangerously-skip-permissions`.
+    permission_mode: Optional[str] = None
+    # Zakázané nástroje navíc k výchozímu `AskUserQuestion` (sloučí se do
+    # jediného `--disallowedTools`, opakovaná volba by se přepisovala).
+    disallowed_tools: Sequence[str] = field(default_factory=list)
     chrome: bool = False
     resume_session_id: Optional[str] = None
     append_system_prompt_file: Optional[str] = None
@@ -86,16 +111,17 @@ class ClaudeRunConfig:
         else:
             args = []
 
-        args.extend(
-            [
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--dangerously-skip-permissions",
-                "--disallowedTools",
-                "AskUserQuestion",
-            ]
-        )
+        args.extend(["--output-format", "stream-json", "--verbose"])
+        if self.permission_mode:
+            args += ["--permission-mode", self.permission_mode]
+        elif self.dangerously_skip_permissions:
+            args.append("--dangerously-skip-permissions")
+        disallowed: List[str] = ["AskUserQuestion"]
+        for tool in self.disallowed_tools:
+            tool = (tool or "").strip()
+            if tool and tool not in disallowed:
+                disallowed.append(tool)
+        args += ["--disallowedTools", ",".join(disallowed)]
         if self.resume_session_id:
             args += ["--resume", self.resume_session_id]
         if self.chrome:
@@ -212,6 +238,7 @@ class ClaudeCodeClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            preexec_fn=_set_parent_death_signal,
         )
 
         if on_proc_started is not None:
@@ -507,6 +534,12 @@ class ClaudeCodeClient:
                         "session_id": self.session_id,
                         "is_error": bool(event.get("is_error", False)),
                         "subtype": event.get("subtype"),
+                        "structured_output": event.get("structured_output"),
+                        "num_turns": event.get("num_turns"),
+                        "duration_ms": event.get("duration_ms"),
+                        "api_error_status": event.get("api_error_status"),
+                        "terminal_reason": event.get("terminal_reason"),
+                        "errors": event.get("errors"),
                     },
                     raw=event,
                 )
