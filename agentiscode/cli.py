@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import shlex
@@ -36,7 +37,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 from agentiscode.core import AgentConfig, AgentEvent, AgentWrapper, normalize_adapter
+from agentiscode.output_schema import OutputSchema, OutputSchemaError
 from agentiscode.telemetry import AgentisTelemetry
+
+#: Exit kód, když odpověď agenta neodpovídá ``--output-schema`` ani po opravách.
+EXIT_SCHEMA_INVALID = 3
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +152,8 @@ class OutputRecorder:
     ``--session-output`` se zapíše hned, jakmile je session id známé;
     ``--final-output`` až po skončení běhu. Finální text se skládá stejně jako
     v telemetrii: poslední souvislý blok ``text`` eventů (přerušený nástrojem
-    nebo reasoningem se začíná skládat znovu).
+    nebo reasoningem se začíná skládat znovu). S ``--output-schema`` ho nahradí
+    zvalidovaný JSON (:meth:`set_final`), nevalidní odpověď se nezapíše vůbec.
     """
 
     def __init__(self, final_path: Optional[str] = None, session_path: Optional[str] = None) -> None:
@@ -156,6 +162,23 @@ class OutputRecorder:
         self._session_written = False
         self._final_chunks: list[str] = []
         self._final_open = False
+        self._final_override: Optional[str] = None
+        self._final_discarded = False
+
+    def final_text(self) -> str:
+        return "".join(self._final_chunks).strip()
+
+    def set_final(self, text: str) -> None:
+        self._final_override = text
+
+    def reset_final(self) -> None:
+        """Zahodí složenou odpověď před dalším (opravným) turnem."""
+        self._final_chunks.clear()
+        self._final_open = False
+        self._final_override = None
+
+    def discard_final(self) -> None:
+        self._final_discarded = True
 
     def handle(self, event: AgentEvent) -> None:
         if event.type == "text":
@@ -175,8 +198,9 @@ class OutputRecorder:
                 self._session_written = True
 
     def finish(self) -> None:
-        if self._final_path:
-            self._write(self._final_path, "".join(self._final_chunks).strip() + "\n")
+        if self._final_path and not self._final_discarded:
+            final = self._final_override if self._final_override is not None else self.final_text()
+            self._write(self._final_path, final + "\n")
 
     @staticmethod
     def _write(path: str, content: str) -> None:
@@ -285,6 +309,20 @@ def _parser() -> argparse.ArgumentParser:
         help="Po skončení běhu ulož finální odpověď agenta do souboru.",
     )
     parser.add_argument(
+        "--output-schema",
+        metavar="PATH",
+        help="JSON Schema finální odpovědi. Claude ho dostane nativně (--json-schema), OpenCode v promptu; "
+        "odpověď se validuje a při chybě se agent přes --resume požádá o opravu. --final-output pak obsahuje "
+        f"zvalidovaný JSON; když oprava nepomůže, skončí kódem {EXIT_SCHEMA_INVALID}.",
+    )
+    parser.add_argument(
+        "--schema-retries",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Kolikrát agenta požádat o opravu odpovědi, která neodpovídá --output-schema (default: 2).",
+    )
+    parser.add_argument(
         "--session-output",
         metavar="PATH",
         help="Ulož agent session id do souboru, jakmile je známé.",
@@ -371,8 +409,8 @@ async def _run(
     json_mode: bool,
     telemetry: Optional[AgentisTelemetry] = None,
     recorder: Optional[OutputRecorder] = None,
+    schema: Optional[OutputSchema] = None,
 ) -> int:
-    wrapper = AgentWrapper(config)
     renderer: Any = JsonRenderer() if json_mode else TextRenderer()
 
     proc_holder: Dict[str, Any] = {}
@@ -399,17 +437,42 @@ async def _run(
         telemetry.start()
 
     exit_code = 0
+    attempt = 0
     try:
-        async for event in wrapper.stream(prompt, on_proc_started=_on_proc):
-            if event.type == "error":
-                exit_code = 1
-            elif event.type == "result" and event.data.get("is_error"):
-                exit_code = 1
-            renderer.handle(event)
-            if recorder is not None:
-                recorder.handle(event)
-            if telemetry is not None:
-                telemetry.handle(event)
+        while True:
+            wrapper = AgentWrapper(config)
+            result: Dict[str, Any] = {}
+            async for event in wrapper.stream(prompt, on_proc_started=_on_proc):
+                if event.type == "error":
+                    exit_code = 1
+                elif event.type == "result":
+                    result = event.data
+                    if event.data.get("is_error"):
+                        exit_code = 1
+                renderer.handle(event)
+                if recorder is not None:
+                    recorder.handle(event)
+                if telemetry is not None:
+                    telemetry.handle(event)
+            if schema is None or recorder is None or exit_code:
+                break
+
+            value, errors = schema.extract(result, recorder.final_text())
+            if not errors:
+                recorder.set_final(json.dumps(value, ensure_ascii=False, indent=2))
+                break
+            # Opravný turn naváže na stejnou session, aby agent viděl svou odpověď i chyby.
+            session_id = result.get("session_id") or wrapper.session_id
+            attempt += 1
+            if attempt > schema.retries or not session_id:
+                _log_schema_errors("odpověď neodpovídá --output-schema, vzdávám to", errors)
+                recorder.discard_final()
+                exit_code = EXIT_SCHEMA_INVALID
+                break
+            _log_schema_errors(f"odpověď neodpovídá --output-schema, oprava {attempt}/{schema.retries}", errors)
+            recorder.reset_final()
+            config = dataclasses.replace(config, resume_session_id=session_id)
+            prompt = schema.repair_prompt(errors)
     except asyncio.CancelledError:
         _kill(proc_holder.get("proc"))
         if terminating_signal:
@@ -426,6 +489,11 @@ async def _run(
         if telemetry is not None and not interrupted:
             telemetry.finish()
     return exit_code
+
+
+def _log_schema_errors(message: str, errors: Sequence[str]) -> None:
+    sys.stderr.write(f"[agentiscode] {message}:\n" + "".join(f"  - {error}\n" for error in errors))
+    sys.stderr.flush()
 
 
 def _kill(proc: Optional[asyncio.subprocess.Process]) -> None:
@@ -454,6 +522,18 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     prompt = _read_prompt(args.prompt)
     if not prompt:
         _parser().error("Chybí prompt (zadej ho jako argument nebo na stdin).")
+    schema: Optional[OutputSchema] = None
+    extra_args = list(args.extra_args_json)
+    if args.output_schema:
+        if args.schema_retries < 0:
+            _parser().error("--schema-retries musí být >= 0.")
+        try:
+            schema = OutputSchema.load(args.output_schema, retries=args.schema_retries)
+        except OutputSchemaError as exc:
+            _parser().error(str(exc))
+        adapter = normalize_adapter(args.adapter)
+        extra_args += schema.runtime_args(adapter)
+        prompt += schema.prompt_suffix(adapter)
     if not args.resume:
         prompt = _append_context_ids(prompt, args.task_id, args.project_id)
 
@@ -466,7 +546,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         cwd=cwd,
         resume_session_id=args.resume,
         timeout_sec=args.timeout,
-        extra_args=args.extra_args_json,
+        extra_args=extra_args,
         permission_mode=args.permission_mode,
         disallowed_tools=[t for t in (args.disallowed_tools or "").split(",") if t.strip()],
     )
@@ -500,11 +580,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     recorder: Optional[OutputRecorder] = None
-    if args.final_output or args.session_output:
+    if args.final_output or args.session_output or schema is not None:
         recorder = OutputRecorder(final_path=args.final_output, session_path=args.session_output)
 
     try:
-        return asyncio.run(_run(config, prompt, args.json, telemetry, recorder))
+        return asyncio.run(_run(config, prompt, args.json, telemetry, recorder, schema))
     except KeyboardInterrupt:
         sys.stderr.write("\nPřerušeno.\n")
         return 130

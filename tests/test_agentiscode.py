@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 from typing import Any
 
 import pytest
@@ -887,3 +888,175 @@ def test_claude_crash_without_result_yields_synthetic_error_result(monkeypatch) 
     assert events[1].data["exit_code"] == 1
     assert events[-1].data["is_error"] is True
     assert events[-1].data["synthetic"] is True
+
+
+# ---------------------------------------------------------------------------
+# --output-schema
+# ---------------------------------------------------------------------------
+
+
+_SELECTION_SCHEMA = {
+    "type": "object",
+    "properties": {"ids": {"type": "array", "items": {"enum": [1, 2, 3]}}},
+    "required": ["ids"],
+    "additionalProperties": False,
+}
+
+
+def _scripted_subprocess(outputs: list[list[str]], calls: list[dict[str, Any]]):
+    """Každé volání runtime CLI vrátí další připravený stdout; argumenty a stdin si uloží."""
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> _FakeProcess:
+        proc = _FakeProcess(stdout_lines=outputs[len(calls)], stderr_lines=[], returncode=0)
+        argv = list(args)
+        if argv[:2] == ["bash", "-c"]:  # Claude runner spouští `bash -c "exec claude …"`
+            argv = shlex.split(argv[2])
+        calls.append({"args": argv, "stdin": proc.stdin})
+        return proc
+
+    return fake_create_subprocess_exec
+
+
+def _claude_result(structured: Any, session_id: str = "s1") -> list[str]:
+    return [
+        json.dumps({"type": "system", "subtype": "init", "session_id": session_id, "model": "claude-x"}) + "\n",
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": session_id,
+                "is_error": False,
+                "result": "",
+                "structured_output": structured,
+            }
+        )
+        + "\n",
+    ]
+
+
+def _opencode_text(text: str, session_id: str = "ses_1") -> list[str]:
+    return [
+        json.dumps(
+            {
+                "type": "text",
+                "sessionID": session_id,
+                "part": {"id": "p1", "messageID": "m1", "type": "text", "text": text},
+            }
+        )
+        + "\n"
+    ]
+
+
+def _write_schema(tmp_path) -> str:
+    path = tmp_path / "selection.schema.json"
+    path.write_text(json.dumps(_SELECTION_SCHEMA), encoding="utf-8")
+    return str(path)
+
+
+def test_cli_output_schema_passes_json_schema_to_claude_and_writes_structured_output(monkeypatch, tmp_path) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "agentiscode.runners.claude.asyncio.create_subprocess_exec",
+        _scripted_subprocess([_claude_result({"ids": [1, 3]})], calls),
+    )
+    final_path = tmp_path / "selection.json"
+    schema_path = tmp_path / "selection.schema.json"
+    schema_path.write_text(
+        json.dumps({"$schema": "https://json-schema.org/draft/2020-12/schema", **_SELECTION_SCHEMA}), encoding="utf-8"
+    )
+
+    exit_code = run(
+        ["--adapter", "claude", "--output-schema", str(schema_path), "--final-output", str(final_path), "vyber"]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    args = calls[0]["args"]
+    # `$schema` se Claude nepředává (ajv v Claude Code nezná meta-schema draftu 2020-12).
+    assert json.loads(args[args.index("--json-schema") + 1]) == _SELECTION_SCHEMA
+    assert json.loads(final_path.read_text(encoding="utf-8")) == {"ids": [1, 3]}
+
+
+def test_cli_output_schema_resumes_session_with_validation_errors(monkeypatch, tmp_path) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "agentiscode.runners.claude.asyncio.create_subprocess_exec",
+        _scripted_subprocess([_claude_result({"ids": [7]}), _claude_result({"ids": [2]})], calls),
+    )
+    final_path = tmp_path / "selection.json"
+
+    exit_code = run(
+        ["--adapter", "claude", "--output-schema", _write_schema(tmp_path), "--final-output", str(final_path), "vyber"]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 2
+    repair_args = calls[1]["args"]
+    assert repair_args[repair_args.index("--resume") + 1] == "s1"
+    assert "--json-schema" in repair_args
+    repair_prompt = bytes(calls[1]["stdin"].data).decode("utf-8")
+    assert "$.ids[0]: 7 is not one of [1, 2, 3]" in repair_prompt
+    assert json.loads(final_path.read_text(encoding="utf-8")) == {"ids": [2]}
+
+
+def test_cli_output_schema_gives_up_after_retries_without_writing_output(monkeypatch, tmp_path, capsys) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "agentiscode.runners.claude.asyncio.create_subprocess_exec",
+        _scripted_subprocess([_claude_result({"ids": [7]}), _claude_result({"x": 1})], calls),
+    )
+    final_path = tmp_path / "selection.json"
+
+    exit_code = run(
+        [
+            "--adapter",
+            "claude",
+            "--output-schema",
+            _write_schema(tmp_path),
+            "--schema-retries",
+            "1",
+            "--final-output",
+            str(final_path),
+            "vyber",
+        ]
+    )
+
+    assert exit_code == 3
+    assert len(calls) == 2
+    assert not final_path.exists()
+    assert "vzdávám to" in capsys.readouterr().err
+
+
+def test_cli_output_schema_puts_schema_into_opencode_prompt_and_parses_text(monkeypatch, tmp_path) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "agentiscode.runners.opencode.asyncio.create_subprocess_exec",
+        _scripted_subprocess([_opencode_text('```json\n{"ids": [3]}\n```')], calls),
+    )
+    final_path = tmp_path / "selection.json"
+
+    exit_code = run(
+        ["--adapter", "opencode", "--output-schema", _write_schema(tmp_path), "--final-output", str(final_path), "vyber"]
+    )
+
+    assert exit_code == 0
+    assert "--json-schema" not in calls[0]["args"]
+    sent = " ".join(calls[0]["args"]) + bytes(calls[0]["stdin"].data).decode("utf-8")
+    assert "Formát odpovědi" in sent and '"enum"' in sent
+    assert json.loads(final_path.read_text(encoding="utf-8")) == {"ids": [3]}
+
+
+def test_cli_output_schema_rejects_invalid_schema(tmp_path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({"type": "nonsense"}), encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        run(["--adapter", "claude", "--output-schema", str(path), "vyber"])
+
+
+def test_parse_json_text_tolerates_fences_and_surrounding_text() -> None:
+    from agentiscode.output_schema import parse_json_text
+
+    assert parse_json_text('Tady je výsledek:\n{"a": [1]}\nHotovo.') == ({"a": [1]}, None)
+    assert parse_json_text("```json\n[1, 2]\n```") == ([1, 2], None)
+    assert parse_json_text("nic")[1] == "odpověď neobsahuje JSON"

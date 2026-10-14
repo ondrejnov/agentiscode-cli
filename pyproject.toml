@@ -12,6 +12,7 @@ agentiscode = "agentiscode.cli:main"
 [tool.poetry.dependencies]
 python = ">=3.13,<3.14"
 requests = "^2.33.1"
+jsonschema = "^4.23"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.2"

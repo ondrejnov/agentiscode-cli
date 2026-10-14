@@ -94,10 +94,32 @@ was computed by the wrapper because the runtime did not emit one (crash, timeout
 | `--agentis-service-token TOKEN` | Service callback token; defaults to `AGENTIS_SERVICE_TOKEN`. |
 | `--final-output PATH` | Write the final contiguous assistant text block to a file. |
 | `--session-output PATH` | Write the coding-agent session ID as soon as it is known. |
+| `--output-schema PATH` | JSON Schema the final answer must satisfy (see [Structured Output](#structured-output)). |
+| `--schema-retries N` | How many times to ask the agent to fix an answer that fails `--output-schema`; defaults to `2`. |
 | `PROMPT ...` | Prompt words; when omitted, the prompt is read from stdin. |
 
 For a new session, `--task-id` and `--project-id` are appended to the prompt as `agentis_task_id` and
 `agentis_project_id` XML tags. They are not appended when `--resume` is used.
+
+## Structured Output
+
+```bash
+agentiscode --adapter claude --model claude-sonnet-5-5 \
+  --output-schema .agentis/schemas/selection.schema.json \
+  --final-output outputs/selection.json < prompt.md
+```
+
+`--output-schema` makes the final answer a JSON document validated against the schema:
+
+- Claude and `claude-p` receive the schema natively (`--json-schema`); the answer is taken from `structured_output`.
+  The top-level `$schema` key is not forwarded (Claude Code's validator only knows its default draft); local
+  validation still honours it.
+- OpenCode has no native support, so the schema is appended to the prompt and the JSON is parsed from the final text
+  (Markdown code fences and surrounding prose are tolerated).
+- The answer is always validated locally as well. When it does not match, the same session is resumed (`--resume`)
+  with the list of validation errors and the agent is asked to answer again, up to `--schema-retries` times.
+- `--final-output` then contains the validated, pretty-printed JSON. If the answer still does not match, nothing is
+  written and the command exits with code `3`; runtime failures keep exit code `1`.
 
 ## Agentis Reporting
 
