@@ -78,6 +78,7 @@ was computed by the wrapper because the runtime did not emit one (crash, timeout
 | `--resume SESSION_ID` | Resume an existing coding-agent session. |
 | `--timeout SECONDS` | Whole-run timeout; `0` means no timeout. |
 | `--json` | Emit normalized flattened JSON Lines on stdout. |
+| `--die-with-parent` | Linux: terminate (as on SIGTERM) when the parent process dies, even by SIGKILL. Default from `$AGENTISCODE_DIE_WITH_PARENT`; ultracode sets it for its agents. |
 | `--permission-mode MODE` | Claude only: pass `--permission-mode MODE` instead of the default `--dangerously-skip-permissions`. |
 | `--disallowed-tools LIST` | Claude only: comma-separated tools disallowed in addition to `AskUserQuestion` (merged into one `--disallowedTools`). |
 | `--extra-args-json JSON` | JSON array of strings appended verbatim to the runtime CLI arguments, e.g. `'["--json-schema","{...}"]'`. |
@@ -100,6 +101,10 @@ was computed by the wrapper because the runtime did not emit one (crash, timeout
 
 For a new session, `--task-id` and `--project-id` are appended to the prompt as `agentis_task_id` and
 `agentis_project_id` XML tags. They are not appended when `--resume` is used.
+
+## Termination
+
+On SIGTERM/SIGINT the agent gets SIGTERM and 2 s to clean up, then SIGKILL. After that every remaining descendant gets SIGTERM, then SIGKILL after another 2 s. Descendants are found under agentiscode because it is a child subreaper on Linux. This covers processes that the agent's Bash tool started in their own sessions (for example `ultracode run` and its subagents), which a `killpg` of the agent's group does not reach. The whole shutdown fits into the 5 s grace period that `agentis-workflow` gives a step. A second signal kills the agent immediately.
 
 ## Structured Output
 

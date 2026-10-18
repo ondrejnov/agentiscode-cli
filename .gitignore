@@ -8,3 +8,5 @@ agent-container
 agent-container/registry-secret.yaml
 agent-container/agdoc/
 agent-container/agentiscode-cli/
+.ultracode
+.agentis

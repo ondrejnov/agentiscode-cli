@@ -38,10 +38,18 @@ from typing import Any, Dict, Optional, Sequence
 
 from agentiscode.core import AgentConfig, AgentEvent, AgentWrapper, normalize_adapter
 from agentiscode.output_schema import OutputSchema, OutputSchemaError
+from agentiscode.proctree import become_subreaper, die_with_parent, terminate_descendants
 from agentiscode.telemetry import AgentisTelemetry
 
 #: Exit kód, když odpověď agenta neodpovídá ``--output-schema`` ani po opravách.
 EXIT_SCHEMA_INVALID = 3
+
+# Ukončení signálem se musí vejít do lhůty volajícího (agentis-workflow dává
+# kroku 5 s mezi SIGTERM a SIGKILL): agent dostane SIGTERM a tuto lhůtu na úklid,
+# pak SIGKILL; potom stejně tak zbylí potomci (procesy z Bash toolu, které
+# běží ve vlastních sessions a killpg agenta je nezasáhne).
+_AGENT_TERM_GRACE_SEC = 2.0
+_DESCENDANTS_TERM_GRACE_SEC = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +245,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=0.0, help="Časový limit běhu v sekundách (0 = bez limitu).")
     parser.add_argument("--json", action="store_true", help="Streamuj sjednocené eventy jako JSON Lines na stdout.")
     parser.add_argument(
+        "--die-with-parent",
+        action="store_true",
+        default=os.environ.get("AGENTISCODE_DIE_WITH_PARENT", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Linux: po smrti rodičovského procesu (i SIGKILL) se ukonči jako po SIGTERM (default: $AGENTISCODE_DIE_WITH_PARENT).",
+    )
+    parser.add_argument(
         "--permission-mode",
         metavar="MODE",
         help="Claude: --permission-mode (místo výchozího --dangerously-skip-permissions).",
@@ -420,13 +434,24 @@ async def _run(
     def _on_proc(proc: asyncio.subprocess.Process) -> None:
         proc_holder["proc"] = proc
 
+    loop = asyncio.get_running_loop()
+
     def _terminate(signum: int) -> None:
+        proc = proc_holder.get("proc")
+        if terminating_signal:
+            # Opakovaný signál: nečekáme na lhůtu.
+            _kill(proc)
+            return
         terminating_signal["signum"] = signum
-        _kill(proc_holder.get("proc"))
+        # Nejdřív SIGTERM, ať agent stihne uklidit své potomky; po lhůtě tvrdě.
+        _signal_group(proc, signal.SIGTERM)
+        loop.call_later(_AGENT_TERM_GRACE_SEC, _kill, proc)
         if task is not None:
             task.cancel()
 
-    loop = asyncio.get_running_loop()
+    # Osiřelí potomci agenta (Bash tool má vlastní session) přejdou pod nás,
+    # takže je po smrti agenta pořád najdeme a ukončíme.
+    become_subreaper()
     installed_handlers: list[int] = []
     for signum in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError, RuntimeError):
@@ -475,6 +500,7 @@ async def _run(
             prompt = schema.repair_prompt(errors)
     except asyncio.CancelledError:
         _kill(proc_holder.get("proc"))
+        terminate_descendants(_DESCENDANTS_TERM_GRACE_SEC)
         if terminating_signal:
             return 130 if terminating_signal["signum"] == signal.SIGINT else 143
         raise
@@ -497,13 +523,17 @@ def _log_schema_errors(message: str, errors: Sequence[str]) -> None:
 
 
 def _kill(proc: Optional[asyncio.subprocess.Process]) -> None:
+    _signal_group(proc, signal.SIGKILL)
+
+
+def _signal_group(proc: Optional[asyncio.subprocess.Process], signum: int) -> None:
     if proc is None or proc.returncode is not None:
         return
     with contextlib.suppress(Exception):
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(os.getpgid(proc.pid), signum)
         return
     with contextlib.suppress(Exception):
-        proc.kill()
+        proc.send_signal(signum)
 
 
 def run(argv: Optional[Sequence[str]] = None) -> int:
@@ -518,6 +548,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         normalize_adapter(args.adapter)
     except ValueError as exc:
         _parser().error(str(exc))
+
+    if args.die_with_parent:
+        die_with_parent(signal.SIGTERM)
 
     prompt = _read_prompt(args.prompt)
     if not prompt:
