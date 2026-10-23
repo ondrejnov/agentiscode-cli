@@ -465,3 +465,99 @@ def test_telemetry_requires_task_id_and_endpoint() -> None:
         AgentisTelemetry(task_id=" ", prompt="x", adapter="claude", endpoint="http://x")
     with pytest.raises(ValueError, match="endpoint"):
         AgentisTelemetry(task_id="task-1", prompt="x", adapter="claude")
+
+
+def _background_bash_run(*, notification_status: str | None) -> dict[str, Any]:
+    """Prožene reálné Claude stream-json řádky Bashe přesunutého na pozadí všemi vrstvami."""
+    from agentiscode.core import _ClaudeTranslator
+    from agentiscode.runners.claude import ClaudeCodeClient, ClaudeRunConfig
+
+    lines: list[dict[str, Any]] = [
+        {"type": "system", "subtype": "init", "session_id": "ses_bg", "model": "claude-x"},
+        {
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "content": [{"type": "tool_use", "id": "toolu_bg", "name": "Bash", "input": {"command": "ultracode run x"}}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_bg",
+                        "content": "Command did not complete within its 600s timeout and was moved to the background (ID: b1).",
+                        "is_error": False,
+                    }
+                ]
+            },
+            "tool_use_result": {"stdout": "", "stderr": "", "interrupted": False, "backgroundTaskId": "b1"},
+        },
+        # další turn agenta = hranice kroku; nástroj na pozadí se nesmí uzavřít
+        {
+            "type": "assistant",
+            "message": {
+                "id": "msg_2",
+                "content": [{"type": "text", "text": "Čekám."}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+    ]
+    if notification_status:
+        lines.append(
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "b1",
+                "tool_use_id": "toolu_bg",
+                "status": notification_status,
+                "summary": "Background command was stopped",
+            }
+        )
+    lines.append({"type": "result", "session_id": "ses_bg", "usage": {}, "is_error": False})
+
+    native = ClaudeCodeClient(config=ClaudeRunConfig(command="/usr/bin/claude"))
+    translate = _ClaudeTranslator()
+    client = FakeClient(results={"task.start_run": {"item": {"id": "run-bg"}}})
+    telemetry = AgentisTelemetry(task_id="task-1", prompt="x", adapter="claude", client=client)
+    telemetry.start()
+
+    def tool_part() -> dict[str, Any]:
+        messages = [c for c in client.calls if c["method"] == "session.store_activity_log"][-1]["params"]["messages"]
+        return next(p for m in messages for p in m["parts"] if p.get("callID") == "toolu_bg")
+
+    states: list[str] = []
+    for line in lines:
+        for claude_event in native._normalize(line):
+            for event in translate(claude_event):
+                telemetry.handle(event)
+        if line["type"] == "assistant" and line["message"]["id"] == "msg_2":
+            states.append(tool_part()["state"]["status"])
+    telemetry.finish()
+    return {"running_after_step": states[0], "final": tool_part()["state"]}
+
+
+def test_telemetry_keeps_backgrounded_bash_running_until_task_notification() -> None:
+    result = _background_bash_run(notification_status="completed")
+
+    assert result["running_after_step"] == "running"
+    final = result["final"]
+    assert final["status"] == "completed"
+    assert "moved to the background" in final["output"]
+    assert final["metadata"]["background_task_id"] == "b1"
+
+
+def test_telemetry_marks_stopped_background_bash_as_error() -> None:
+    final = _background_bash_run(notification_status="stopped")["final"]
+
+    assert final["status"] == "error"
+    assert final["error"] == "Background command was stopped"
+
+
+def test_telemetry_closes_background_bash_without_notification_at_finish() -> None:
+    final = _background_bash_run(notification_status=None)["final"]
+
+    assert final["status"] == "error"

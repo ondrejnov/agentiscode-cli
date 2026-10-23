@@ -32,6 +32,8 @@ turnu* (ne kumulativní). Díky tomu lze tokeny sčítat napříč turny — fin
 
 ``tool`` event se vydává při startu nástroje (``status="running"``) a znovu při
 jeho dokončení (``status="completed"`` / ``"error"``); obě fáze sdílejí ``id``.
+Bash přesunutý na pozadí vydá mezi nimi ještě ``running`` s ``output`` a
+``background_task_id``; dokončení přijde až s koncem procesu na pozadí.
 
 Tahle vrstva je úmyslně bez závislosti na Agentisu, Settings nebo Kubernetes —
 je to čistě lokální wrapper. WebSocket transport (přihazování aktivity do
@@ -44,6 +46,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
 
 import asyncio
+import signal
 
 from agentiscode.runners.claude import ClaudeCodeClient, ClaudeEvent, ClaudeRunConfig
 from agentiscode.runners.opencode import OpenCodeEvent, OpenCodeRunConfig, OpenCodeRunner
@@ -235,6 +238,20 @@ class _ClaudeTranslator:
                 )
             ]
         if t == "tool_result":
+            if d.get("background_task_id") and not d.get("is_error"):
+                # Nástroj vrátil výsledek, ale proces běží dál na pozadí → konec
+                # ohlásí až `task_notification`.
+                return [
+                    AgentEvent(
+                        "tool",
+                        {
+                            "id": d.get("tool_use_id"),
+                            "status": "running",
+                            "output": _stringify(d.get("content")),
+                            "background_task_id": d.get("background_task_id"),
+                        },
+                    )
+                ]
             return [
                 AgentEvent(
                     "tool",
@@ -245,6 +262,12 @@ class _ClaudeTranslator:
                     },
                 )
             ]
+        if t == "task_notification":
+            if not d.get("tool_use_id"):
+                return []
+            if d.get("status") == "completed":
+                return [AgentEvent("tool", {"id": d.get("tool_use_id"), "status": "completed"})]
+            return [AgentEvent("tool", {"id": d.get("tool_use_id"), "status": "error", "error": d.get("summary") or ""})]
         if t == "result":
             payload: Dict[str, Any] = {
                 "session_id": d.get("session_id"),
@@ -553,8 +576,23 @@ class AgentWrapper:
                     "is_error": saw_error or getattr(self._runner, "last_error", None) is not None,
                     # Runtime nevydal vlastní `result` (pád, timeout, …) — dopočítaný.
                     "synthetic": True,
+                    # Jak runtime skončil — i „čistý“ exit 0 bez resultu se musí dát odlišit od kill signálem.
+                    **_exit_info(getattr(self._runner, "last_exit_code", None)),
                 },
             )
+
+
+def _exit_info(returncode: Optional[int]) -> Dict[str, Any]:
+    """`exit_code` / `exit_signal` pro syntetický result (asyncio: záporný kód = signál)."""
+    if returncode is None:
+        return {"exit_code": None, "exit_signal": None}
+    if returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"SIG{-returncode}"
+        return {"exit_code": None, "exit_signal": name}
+    return {"exit_code": returncode, "exit_signal": None}
 
 
 __all__ = [

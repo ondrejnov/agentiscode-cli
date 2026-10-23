@@ -175,6 +175,8 @@ class ClaudeCodeClient:
         self.last_result: Optional[Dict[str, Any]] = None
         self.last_usage: Optional[Dict[str, Any]] = None
         self.last_cost_usd: Optional[float] = None
+        # Návratový kód claude posledního běhu (záporný = ukončen signálem); None = neskončil / neběžel.
+        self.last_exit_code: Optional[int] = None
 
     @staticmethod
     def _failure_stderr_summary(stderr_lines: list[str], returncode: int) -> str:
@@ -212,7 +214,8 @@ class ClaudeCodeClient:
           - session_start: {session_id, model, tools?, cwd?}
           - text: {text}                         (assistant text delta/blok)
           - tool_use: {id, name, input}
-          - tool_result: {tool_use_id, content, is_error}
+          - tool_result: {tool_use_id, content, is_error, background_task_id?}
+          - task_notification: {task_id, tool_use_id, status, summary}
           - assistant_message: {message}         (kompletní zpráva)
           - thinking: {text}
           - result: {summary, usage, cost_usd, session_id, is_error, subtype}
@@ -345,6 +348,7 @@ class ClaudeCodeClient:
                 pass
             with contextlib.suppress(BaseException):
                 await stderr_task
+            self.last_exit_code = proc.returncode
 
             # Zbytek stderru.
             tail: List[str] = []
@@ -489,25 +493,44 @@ class ClaudeCodeClient:
             # `user` zprávy v stream-json obvykle obsahují tool_result bloky.
             message = event.get("message") or {}
             content = message.get("content") or []
+            # Bash přesunutý na pozadí (run_in_background, timeout, doručení zprávy)
+            # vrací tool_result hned, ale proces běží dál až do `task_notification`.
+            tool_use_result = event.get("tool_use_result")
+            background_task_id = (
+                tool_use_result.get("backgroundTaskId") if isinstance(tool_use_result, dict) else None
+            )
             emitted = False
             for block in content:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_result":
-                    out.append(
-                        ClaudeEvent(
-                            "tool_result",
-                            {
-                                "tool_use_id": block.get("tool_use_id"),
-                                "content": block.get("content"),
-                                "is_error": bool(block.get("is_error", False)),
-                            },
-                            raw=event,
-                        )
-                    )
+                    data = {
+                        "tool_use_id": block.get("tool_use_id"),
+                        "content": block.get("content"),
+                        "is_error": bool(block.get("is_error", False)),
+                    }
+                    if background_task_id:
+                        data["background_task_id"] = background_task_id
+                    out.append(ClaudeEvent("tool_result", data, raw=event))
                     emitted = True
             if not emitted:
                 out.append(ClaudeEvent("user_message", {"message": message}, raw=event))
+            return out
+
+        if etype == "system" and event.get("subtype") == "task_notification":
+            # Konec úlohy na pozadí (status: completed | failed | stopped | killed).
+            out.append(
+                ClaudeEvent(
+                    "task_notification",
+                    {
+                        "task_id": event.get("task_id"),
+                        "tool_use_id": event.get("tool_use_id"),
+                        "status": event.get("status"),
+                        "summary": event.get("summary"),
+                    },
+                    raw=event,
+                )
+            )
             return out
 
         if etype == "result":

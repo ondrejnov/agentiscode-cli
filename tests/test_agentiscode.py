@@ -888,6 +888,42 @@ def test_claude_crash_without_result_yields_synthetic_error_result(monkeypatch) 
     assert events[1].data["exit_code"] == 1
     assert events[-1].data["is_error"] is True
     assert events[-1].data["synthetic"] is True
+    assert events[-1].data["exit_code"] == 1
+    assert events[-1].data["exit_signal"] is None
+
+
+def test_claude_clean_exit_without_result_reports_exit_code_zero(monkeypatch) -> None:
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> _FakeProcess:
+        return _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=0)
+
+    monkeypatch.setattr("agentiscode.runners.claude.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect() -> list[AgentEvent]:
+        wrapper = AgentWrapper(AgentConfig(adapter="claude", cwd="/w"))
+        return [event async for event in wrapper.stream("Do X")]
+
+    events = asyncio.run(collect())
+    assert [e.type for e in events] == ["result"]
+    assert events[-1].data["is_error"] is False
+    assert events[-1].data["synthetic"] is True
+    assert events[-1].data["exit_code"] == 0
+    assert events[-1].data["exit_signal"] is None
+
+
+def test_claude_killed_by_signal_without_result_reports_signal(monkeypatch) -> None:
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> _FakeProcess:
+        return _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=-9)
+
+    monkeypatch.setattr("agentiscode.runners.claude.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def collect() -> list[AgentEvent]:
+        wrapper = AgentWrapper(AgentConfig(adapter="claude", cwd="/w"))
+        return [event async for event in wrapper.stream("Do X")]
+
+    events = asyncio.run(collect())
+    assert events[-1].data["synthetic"] is True
+    assert events[-1].data["exit_code"] is None
+    assert events[-1].data["exit_signal"] == "SIGKILL"
 
 
 # ---------------------------------------------------------------------------

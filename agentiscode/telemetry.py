@@ -56,6 +56,11 @@ def _unified_to_native(event: AgentEvent) -> Optional[ClaudeEvent]:
         return ClaudeEvent("thinking", {"text": d.get("text") or ""})
     if t == "tool":
         status = d.get("status")
+        if status == "running" and d.get("background_task_id"):
+            return ClaudeEvent(
+                "tool_result",
+                {"tool_use_id": d.get("id"), "content": d.get("output"), "background_task_id": d.get("background_task_id")},
+            )
         if status == "running":
             return ClaudeEvent("tool_use", {"id": d.get("id"), "name": d.get("name"), "input": d.get("input")})
         if status in ("completed", "error"):
@@ -273,6 +278,8 @@ class AgentisTelemetry:
         if self.run_id is None:
             return
         for session_id, state in self._sessions.items():
+            if state.mapper.close_background_tools():
+                state.dirty = True
             if not state.bound:
                 self._bind_session(
                     session_id,

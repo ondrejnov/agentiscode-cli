@@ -23,7 +23,10 @@ Pravidla mapování:
   assistant.content[thinking]          → ReasoningPart
   assistant.content[tool_use]          → ToolPart{state.status="running"}
   user.content[tool_result]            → ToolPart{state.status="completed"
-                                          | "error" pokud is_error}
+                                          | "error" pokud is_error
+                                          | "running" pokud běží na pozadí}
+  system:task_notification             → ToolPart běžící na pozadí → "completed"
+                                          | "error"
   result                               → uzavře assistant message
                                           (cost, tokens, finish reason)
                                           + přidá StepFinishPart
@@ -471,8 +474,20 @@ class ClaudeActivityMapper:
         if part is None:
             return False
         is_error = bool(data.get("is_error"))
-        output = self._stringify_tool_output(data.get("content"))
         old_state = part.get("state") or {}
+        content = data.get("content")
+        # Dokončení úlohy na pozadí nenese obsah → ponech výstup z tool_resultu.
+        output = self._stringify_tool_output(content) if content is not None else old_state.get("output", "")
+        background_task_id = data.get("background_task_id")
+        if background_task_id and not is_error:
+            # Nástroj vrátil výsledek, ale proces běží dál na pozadí.
+            part["state"] = {
+                **old_state,
+                "status": "running",
+                "output": output,
+                "metadata": {**(old_state.get("metadata") or {}), "background_task_id": background_task_id},
+            }
+            return True
         time_obj = dict(old_state.get("time") or {})
         time_obj["end"] = _now()
         if is_error:
@@ -534,6 +549,9 @@ class ClaudeActivityMapper:
             if part.get("type") != "tool" or not isinstance(tool_state, dict):
                 continue
             if tool_state.get("status") not in {"pending", "running"}:
+                continue
+            if (tool_state.get("metadata") or {}).get("background_task_id"):
+                # Běží na pozadí přes hranici turnu; uzavře ho `task_notification`.
                 continue
             completed_state = dict(tool_state)
             completed_state["status"] = "completed"
@@ -602,6 +620,31 @@ class ClaudeActivityMapper:
             return False
         finish = "stop" if not data.get("is_error") else (data.get("subtype") or "error")
         return self._finalize_assistant(data.get("usage"), data.get("cost_usd"), finish)
+
+    def close_background_tools(self) -> bool:
+        """Na konci běhu uzavře úlohy na pozadí, jejichž konec nepřišel — proces
+        zanikl spolu s agentem, takže je označí jako chybu."""
+        changed = False
+        for entry in self._messages:
+            for part in entry["parts"]:
+                tool_state = part.get("state")
+                if part.get("type") != "tool" or not isinstance(tool_state, dict):
+                    continue
+                if tool_state.get("status") != "running" or not (tool_state.get("metadata") or {}).get(
+                    "background_task_id"
+                ):
+                    continue
+                time_obj = dict(tool_state.get("time") or {})
+                time_obj["end"] = _now()
+                part["state"] = {
+                    "status": "error",
+                    "input": tool_state.get("input") or {},
+                    "error": "Proces na pozadí skončil spolu s během agenta bez výsledku.",
+                    "metadata": tool_state.get("metadata") or {},
+                    "time": time_obj,
+                }
+                changed = True
+        return changed
 
     # ------------------------------------------------------------------
     # Util

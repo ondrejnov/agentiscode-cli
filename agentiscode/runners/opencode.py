@@ -108,6 +108,8 @@ class OpenCodeRunner:
         self.last_usage: Optional[Dict[str, Any]] = None
         self.last_cost_usd: Optional[float] = None
         self.last_error: Optional[Dict[str, Any]] = None
+        # Návratový kód opencode posledního běhu (záporný = ukončen signálem).
+        self.last_exit_code: Optional[int] = None
 
     @staticmethod
     def _failure_stderr_summary(stderr_lines: list[str], returncode: int) -> str:
@@ -277,6 +279,7 @@ class OpenCodeRunner:
                 pass
             with contextlib.suppress(BaseException):
                 await stderr_task
+            self.last_exit_code = proc.returncode
 
             tail: List[str] = []
             while not stderr_queue.empty():
