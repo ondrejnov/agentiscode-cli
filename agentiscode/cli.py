@@ -33,8 +33,10 @@ import os
 import shlex
 import signal
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agentiscode.core import AgentConfig, AgentEvent, AgentWrapper, normalize_adapter
 from agentiscode.output_schema import OutputSchema, OutputSchemaError
@@ -43,6 +45,11 @@ from agentiscode.telemetry import AgentisTelemetry
 
 #: Exit kód, když odpověď agenta neodpovídá ``--output-schema`` ani po opravách.
 EXIT_SCHEMA_INVALID = 3
+#: Exit kód, když běh zastavil vyčerpaný limit předplatného Claude.
+EXIT_RATE_LIMITED = 4
+
+# Rezerva po čase obnovy limitu, než se task v Agentisu znovu spustí.
+_RATE_LIMIT_RESCHEDULE_DELAY = timedelta(minutes=1)
 
 # Ukončení signálem se musí vejít do lhůty volajícího (agentis-workflow dává
 # kroku 5 s mezi SIGTERM a SIGKILL): agent dostane SIGTERM a tuto lhůtu na úklid,
@@ -74,6 +81,7 @@ class TextRenderer:
     def __init__(self) -> None:
         self._tool_names: Dict[str, str] = {}
         self._wrote_text = False
+        self._rate_limit_reported = False
 
     def handle(self, event: AgentEvent) -> None:
         handler = getattr(self, f"_on_{event.type}", None)
@@ -140,6 +148,14 @@ class TextRenderer:
 
     def _on_error(self, data: Dict[str, Any]) -> None:
         self._stderr(f"✗ {data.get('message') or 'chyba'}")
+
+    def _on_rate_limit(self, data: Dict[str, Any]) -> None:
+        if data.get("status") != "rejected" or self._rate_limit_reported:
+            return
+        self._rate_limit_reported = True
+        resets_at = data.get("resets_at")
+        when = f", obnova {datetime.fromtimestamp(resets_at).isoformat(sep=' ', timespec='minutes')}" if resets_at else ""
+        self._stderr(f"✗ vyčerpaný limit Claude ({data.get('rate_limit_type') or 'neznámý'}){when}")
 
     def _on_stderr(self, data: Dict[str, Any]) -> None:
         line = (data.get("line") or "").rstrip()
@@ -342,6 +358,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Ulož agent session id do souboru, jakmile je známé.",
     )
     parser.add_argument(
+        "--agentis-timezone",
+        metavar="TZ",
+        default=os.environ.get("AGENTIS_TIMEZONE"),
+        help="Časová zóna Agentis serveru pro scheduled start tasku po vyčerpání limitu "
+        "(default: $AGENTIS_TIMEZONE, jinak lokální zóna).",
+    )
+    parser.add_argument(
         "--agentis-token",
         metavar="TOKEN",
         default=os.environ.get("AGENTIS_API_TOKEN") or os.environ.get("AGENTIS_TOKEN"),
@@ -424,6 +447,7 @@ async def _run(
     telemetry: Optional[AgentisTelemetry] = None,
     recorder: Optional[OutputRecorder] = None,
     schema: Optional[OutputSchema] = None,
+    agentis_timezone: Optional[ZoneInfo] = None,
 ) -> int:
     renderer: Any = JsonRenderer() if json_mode else TextRenderer()
 
@@ -463,10 +487,11 @@ async def _run(
 
     exit_code = 0
     attempt = 0
+    result: Dict[str, Any] = {}
     try:
         while True:
             wrapper = AgentWrapper(config)
-            result: Dict[str, Any] = {}
+            result = {}
             async for event in wrapper.stream(prompt, on_proc_started=_on_proc):
                 if event.type == "error":
                     exit_code = 1
@@ -479,6 +504,8 @@ async def _run(
                     recorder.handle(event)
                 if telemetry is not None:
                     telemetry.handle(event)
+            if result.get("rate_limited"):
+                exit_code = EXIT_RATE_LIMITED
             if schema is None or recorder is None or exit_code:
                 break
 
@@ -514,7 +541,25 @@ async def _run(
             recorder.finish()
         if telemetry is not None and not interrupted:
             telemetry.finish()
+            if result.get("rate_limited"):
+                _reschedule_after_rate_limit(telemetry, result, agentis_timezone)
     return exit_code
+
+
+def _reschedule_after_rate_limit(
+    telemetry: AgentisTelemetry, result: Dict[str, Any], agentis_timezone: Optional[ZoneInfo]
+) -> None:
+    """Vrátí task do TODO se scheduled startem na obnovu vyčerpaného limitu."""
+    resets_at = result.get("rate_limit_resets_at")
+    if not isinstance(resets_at, str) or not resets_at:
+        sys.stderr.write("[agentiscode] vyčerpaný limit bez času obnovy, task nepřeplánuji.\n")
+        return
+    start = datetime.fromisoformat(resets_at.replace("Z", "+00:00")) + _RATE_LIMIT_RESCHEDULE_DELAY
+    start = max(start, datetime.now(timezone.utc) + _RATE_LIMIT_RESCHEDULE_DELAY)
+    # Agentis ukládá scheduled_at jako naivní čas a porovnává ho se svým lokálním časem.
+    local_start = start.astimezone(agentis_timezone).replace(tzinfo=None)
+    if telemetry.schedule_retry(local_start):
+        sys.stderr.write(f"[agentiscode] vyčerpaný limit: task {telemetry.task_id} → TODO, start {local_start.isoformat(sep=' ')}\n")
 
 
 def _log_schema_errors(message: str, errors: Sequence[str]) -> None:
@@ -570,6 +615,13 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     if not args.resume:
         prompt = _append_context_ids(prompt, args.task_id, args.project_id)
 
+    agentis_timezone: Optional[ZoneInfo] = None
+    if args.agentis_timezone:
+        try:
+            agentis_timezone = ZoneInfo(args.agentis_timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            _parser().error(f"Neznámá časová zóna: {args.agentis_timezone}")
+
     cwd = args.cwd or os.getcwd()
     config = AgentConfig(
         adapter=args.adapter,
@@ -617,7 +669,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         recorder = OutputRecorder(final_path=args.final_output, session_path=args.session_output)
 
     try:
-        return asyncio.run(_run(config, prompt, args.json, telemetry, recorder, schema))
+        return asyncio.run(_run(config, prompt, args.json, telemetry, recorder, schema, agentis_timezone))
     except KeyboardInterrupt:
         sys.stderr.write("\nPřerušeno.\n")
         return 130

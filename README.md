@@ -60,11 +60,16 @@ Without `--json`, assistant text is written to stdout and activity is written to
 stream of flattened JSON Lines objects such as `{"type":"text","text":"..."}`.
 
 Event types: `session`, `text`, `reasoning`, `tool` (`status` `running` → `completed`/`error`), `step` (per-turn
-usage), `api_retry` (Claude retrying an API call), `stderr`, `error`, and exactly one final `result`. For Claude the
+usage), `api_retry` (Claude retrying an API call), `rate_limit` (Claude subscription limit state: `status`, `resets_at`
+unix seconds, `rate_limit_type`), `stderr`, `error`, and exactly one final `result`. For Claude the
 `result` also carries the final answer (`result`), `structured_output` (with `--json-schema`), `subtype`, `num_turns`,
 `duration_ms` and, on failure, `api_error_status` / `terminal_reason` / `errors`. A `result` with `"synthetic": true`
 was computed by the wrapper because the runtime did not emit one (crash, timeout); it is `is_error: true` whenever an
 `error` event preceded it.
+
+When a Claude run fails because the subscription limit is exhausted, the `result` carries `"rate_limited": true`,
+`rate_limit_resets_at` (ISO 8601 UTC) and `rate_limit_type`, and the command exits with code `4` (see
+[Usage Limits](#usage-limits)).
 
 ## Options
 
@@ -91,6 +96,7 @@ was computed by the wrapper because the runtime did not emit one (crash, timeout
 | `--session-title TITLE` | Title of the agent's session shown in Agentis (e.g. the name of a workflow subagent). |
 | `--parent-session-id SESSION_ID` | Session the agent's session belongs under in Agentis (e.g. the orchestrator that started it). |
 | `--agentis-api URL` | Agentis JSON-RPC endpoint; defaults to `AGENTIS_ENDPOINT`. |
+| `--agentis-timezone TZ` | Time zone of the Agentis server used for the rescheduled start after a usage limit; defaults to `AGENTIS_TIMEZONE`, then the local zone. |
 | `--agentis-token TOKEN` | User token; defaults to `AGENTIS_API_TOKEN`, then `AGENTIS_TOKEN`. |
 | `--agentis-service-token TOKEN` | Service callback token; defaults to `AGENTIS_SERVICE_TOKEN`. |
 | `--final-output PATH` | Write the final contiguous assistant text block to a file. |
@@ -125,6 +131,20 @@ agentiscode --adapter claude --model claude-sonnet-5-5 \
   with the list of validation errors and the agent is asked to answer again, up to `--schema-retries` times.
 - `--final-output` then contains the validated, pretty-printed JSON. If the answer still does not match, nothing is
   written and the command exits with code `3`; runtime failures keep exit code `1`.
+
+## Usage Limits
+
+Claude Code reports an exhausted subscription limit (session / weekly) as a `rate_limit_event` with
+`status: "rejected"` and `resetsAt`, followed by a synthetic assistant message with `error: "rate_limit"`
+(`You've hit your session limit · resets 3:40pm (Europe/Prague)`). `claude-p` forwards the same message from the
+transcript including `apiErrorParams.rate_limit_info`; when no exact time is available, it is parsed from the text.
+A rejected limit that does not end the run (e.g. covered by overage) is ignored.
+
+Such a run exits with code `4`. With `--task-id`, after the run is closed in Agentis, the task is moved back to
+`TODO` (`task.save`, requires `--agentis-token`) with `scheduled_at` set one minute after the limit resets, so the
+Agentis auto queue starts it again once the limit is available. `scheduled_at` is sent as a naive time in
+`--agentis-timezone`, because Agentis compares it with its local time. Inside a workflow (`--run-id`) the
+orchestrator decides about the task afterwards and may still change its status.
 
 ## Agentis Reporting
 

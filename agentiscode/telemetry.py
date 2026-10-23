@@ -19,6 +19,7 @@ proto se všechna volání obalují a případná chyba se jen ohlásí přes ``
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
@@ -26,6 +27,9 @@ from agentiscode.activity_mapper import ClaudeActivityMapper
 from agentiscode.agentis import AgentisJsonRpcClient, AgentisJsonRpcError
 from agentiscode.core import AgentEvent
 from agentiscode.runners.claude import ClaudeEvent
+
+#: Agentis ``Task.STATUS_TODO``.
+TASK_STATUS_TODO = 2
 
 
 @dataclass
@@ -302,6 +306,24 @@ class AgentisTelemetry:
         # uzavírá až WorkflowManager po aplikaci závěrečných outputs/komentáře.
         if self._owns_run:
             self._emit_adapter_event(status, kind="idle", message=message)
+
+    def schedule_retry(self, scheduled_at: datetime) -> bool:
+        """Vrátí task do TODO s odloženým startem (např. na obnovu limitu Claude).
+
+        ``scheduled_at`` musí být naivní čas v časové zóně Agentis serveru — ten ho
+        porovnává s ``datetime.now()``. Volat až po :meth:`finish`: ``failed`` run
+        přepíná aktivní task do In Review a přepsal by ho.
+        """
+        return self._call_succeeded(
+            "task.save",
+            {
+                "data": {
+                    "id": self.task_id,
+                    "status": TASK_STATUS_TODO,
+                    "scheduled_at": scheduled_at.isoformat(timespec="seconds"),
+                }
+            },
+        )
 
     # ------------------------------------------------------------------
     # Internals

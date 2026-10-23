@@ -18,7 +18,8 @@ Jednotný event slovník (``AgentEvent.type``):
   - ``reasoning`` {text, message_id?}    (reasoning/thinking — vždy delta)
   - ``tool``      {id, name?, status, input?, title?, output?, error?, message_id?}
   - ``step``      {usage?, cost_usd?, message_id?}  (jeden dokončený turn/message — per-turn usage)
-  - ``result``    {session_id?, usage?, cost_usd?, is_error}
+  - ``result``    {session_id?, usage?, cost_usd?, is_error, rate_limited?, rate_limit_resets_at?, rate_limit_type?}
+  - ``rate_limit`` {status, resets_at?, rate_limit_type?, is_using_overage?}  (Claude: stav limitů předplatného)
   - ``error``     {message}
   - ``stderr``    {line}
 
@@ -48,6 +49,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
 import asyncio
 import signal
 
+from agentiscode.rate_limit import RateLimitTracker, parse_resets_at, rate_limit_info_payload
 from agentiscode.runners.claude import ClaudeCodeClient, ClaudeEvent, ClaudeRunConfig
 from agentiscode.runners.opencode import OpenCodeEvent, OpenCodeRunConfig, OpenCodeRunner
 
@@ -290,7 +292,20 @@ class _ClaudeTranslator:
                 if d.get(key) is not None:
                     payload[key] = d.get(key)
             return [AgentEvent("result", payload)]
+        if t == "rate_limit":
+            payload = rate_limit_info_payload(d.get("rate_limit_info"))
+            return [AgentEvent("rate_limit", payload)] if payload else []
         if t == "assistant_message":
+            if d.get("error") == "rate_limit":
+                # Syntetická zpráva „You've hit your … limit“ — limit je vyčerpaný.
+                payload = rate_limit_info_payload(d.get("rate_limit_info"))
+                payload["status"] = "rejected"
+                if payload.get("resets_at") is None:
+                    text = _stringify((d.get("message") or {}).get("content"))
+                    resets_at = parse_resets_at(text)
+                    if resets_at is not None:
+                        payload["resets_at"] = resets_at
+                return [AgentEvent("rate_limit", payload)]
             # Každá assistant zpráva nese vlastní `usage` toho turnu → vydáme
             # per-turn `step`, ať jde sčítat napříč turny (text/tool bloky už
             # máme z dílčích eventů, tady bereme jen usage). Tutéž zprávu (stejné
@@ -554,30 +569,36 @@ class AgentWrapper:
     ) -> AsyncIterator[AgentEvent]:
         emitted_result = False
         saw_error = False
+        rate_limits = RateLimitTracker()
         async for native in self._runner.stream(prompt, on_proc_started=on_proc_started):
             for unified in self._translate(native):
                 if unified.type == "error":
                     saw_error = True
+                elif unified.type == "rate_limit":
+                    rate_limits.observe(unified.data)
                 if self.adapter == OPENCODE:
                     session_id = native.session_id or self._runner.session_id
                     if session_id:
                         unified.data.setdefault("session_id", session_id)
                 if unified.type == "result":
                     emitted_result = True
+                    unified.data.update(rate_limits.result_fields(failed=saw_error or bool(unified.data.get("is_error"))))
                 yield unified
 
         if not emitted_result:
+            is_error = saw_error or getattr(self._runner, "last_error", None) is not None
             yield AgentEvent(
                 "result",
                 {
                     "session_id": self._runner.session_id,
                     "usage": self._runner.last_usage,
                     "cost_usd": self._runner.last_cost_usd,
-                    "is_error": saw_error or getattr(self._runner, "last_error", None) is not None,
+                    "is_error": is_error,
                     # Runtime nevydal vlastní `result` (pád, timeout, …) — dopočítaný.
                     "synthetic": True,
                     # Jak runtime skončil — i „čistý“ exit 0 bez resultu se musí dát odlišit od kill signálem.
                     **_exit_info(getattr(self._runner, "last_exit_code", None)),
+                    **rate_limits.result_fields(failed=is_error),
                 },
             )
 

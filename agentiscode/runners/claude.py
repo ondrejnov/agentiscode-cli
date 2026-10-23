@@ -216,6 +216,7 @@ class ClaudeCodeClient:
           - tool_use: {id, name, input}
           - tool_result: {tool_use_id, content, is_error, background_task_id?}
           - task_notification: {task_id, tool_use_id, status, summary}
+          - rate_limit: {rate_limit_info}       (stav limitů předplatného)
           - assistant_message: {message}         (kompletní zpráva)
           - thinking: {text}
           - result: {summary, usage, cost_usd, session_id, is_error, subtype}
@@ -441,7 +442,7 @@ class ClaudeCodeClient:
             # k normalizaci; `assistant`/`user` necháme propadnout do svých
             # handlerů níž, ať se jejich obsah nezahodí. `result` má vlastní
             # session id i handler, takže ho jako session-start signál nebereme.
-            if etype not in ("assistant", "user"):
+            if etype not in ("assistant", "user", "rate_limit_event"):
                 return out
 
         if etype == "assistant":
@@ -486,7 +487,15 @@ class ClaudeCodeClient:
                 else:
                     out.append(ClaudeEvent("assistant_block", _with_msg_id({"block": block}), raw=event))
             # Doplníme i kompletní message pro klienty, co chtějí surovou zprávu.
-            out.append(ClaudeEvent("assistant_message", _with_msg_id({"message": message}), raw=event))
+            message_data: Dict[str, Any] = {"message": message}
+            # Syntetická zpráva o selhání API (např. `error: "rate_limit"` po vyčerpání
+            # limitu); claude-p z transcriptu přidává i `apiErrorParams` / `quotaLimits`.
+            if event.get("error"):
+                message_data["error"] = event.get("error")
+                rate_limit_info = (event.get("apiErrorParams") or {}).get("rate_limit_info") or event.get("quotaLimits")
+                if isinstance(rate_limit_info, dict):
+                    message_data["rate_limit_info"] = rate_limit_info
+            out.append(ClaudeEvent("assistant_message", _with_msg_id(message_data), raw=event))
             return out
 
         if etype == "user":
@@ -531,6 +540,11 @@ class ClaudeCodeClient:
                     raw=event,
                 )
             )
+            return out
+
+        if etype == "rate_limit_event":
+            # Stav limitů předplatného; `status: "rejected"` = limit vyčerpán.
+            out.append(ClaudeEvent("rate_limit", {"rate_limit_info": event.get("rate_limit_info")}, raw=event))
             return out
 
         if etype == "result":
