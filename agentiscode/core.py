@@ -178,6 +178,9 @@ def tool_title(name: Optional[str], raw_input: Any) -> str:
     if nl in ("task", "agent"):
         desc = raw_input.get("description")
         return _truncate(desc) if isinstance(desc, str) and desc.strip() else fallback
+    if nl == "skill":
+        skill = raw_input.get("skill") or raw_input.get("name")
+        return _truncate(skill) if isinstance(skill, str) and skill.strip() else fallback
     return fallback
 
 
