@@ -608,7 +608,8 @@ class ClaudeActivityMapper:
 
     def _on_step_finish(self, data: Dict[str, Any]) -> bool:
         self._tokens_from_steps = True
-        return self._finalize_assistant(data.get("usage"), data.get("cost_usd"), "stop")
+        # Konec kroku neznamená konec session; ten označí až `mark_finished`.
+        return self._finalize_assistant(data.get("usage"), data.get("cost_usd"), "tool-calls")
 
     def _on_result(self, data: Dict[str, Any]) -> bool:
         if self._tokens_from_steps:
@@ -620,6 +621,16 @@ class ClaudeActivityMapper:
             return False
         finish = "stop" if not data.get("is_error") else (data.get("subtype") or "error")
         return self._finalize_assistant(data.get("usage"), data.get("cost_usd"), finish)
+
+    def mark_finished(self) -> bool:
+        """Na konci běhu označí poslední assistant zprávu jako konec session.
+        Agentis podle ní pozná, že session doběhla, i když run dál běží."""
+        info = self._messages[-1]["info"]
+        if info["role"] != "assistant" or info.get("finish") not in (None, "tool-calls"):
+            return False
+        info["time"].setdefault("completed", _now())
+        info["finish"] = "stop"
+        return True
 
     def close_background_tools(self) -> bool:
         """Na konci běhu uzavře úlohy na pozadí, jejichž konec nepřišel — proces

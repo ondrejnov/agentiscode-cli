@@ -34,6 +34,7 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
 
+from agentiscode.procutil import IS_WINDOWS, command_argv, spawn_kwargs
 from agentiscode.stream_reader import unbounded_line_reader as _unbounded_line_reader
 
 
@@ -171,21 +172,18 @@ class OpenCodeRunner:
         args = cfg.build_args()
         prompt_stdin = prompt.encode("utf-8")
 
-        if not shutil.which("bash"):
+        if not IS_WINDOWS and not shutil.which("bash"):
             yield OpenCodeEvent("error", {"message": "bash nenalezeno v PATH pro lokální spuštění opencode"})
             return
 
-        local_command = "exec " + shlex.join([cfg.command, *args])
         proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-c",
-            local_command,
+            *command_argv(cfg.command, args),
             cwd=cfg.cwd,
             env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            **spawn_kwargs(),
         )
 
         if on_proc_started is not None:

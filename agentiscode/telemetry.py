@@ -284,6 +284,8 @@ class AgentisTelemetry:
         for session_id, state in self._sessions.items():
             if state.mapper.close_background_tools():
                 state.dirty = True
+            if state.mapper.mark_finished():
+                state.dirty = True
             if not state.bound:
                 self._bind_session(
                     session_id,

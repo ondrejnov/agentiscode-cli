@@ -561,3 +561,43 @@ def test_telemetry_closes_background_bash_without_notification_at_finish() -> No
     final = _background_bash_run(notification_status=None)["final"]
 
     assert final["status"] == "error"
+
+
+def _is_session_finished(messages: list[dict[str, Any]]) -> bool:
+    """Stejná podmínka jako `isRunSessionFinished` ve frontendu Agentisu."""
+    info = messages[-1]["info"]
+    return info["role"] == "assistant" and bool(info["time"].get("completed")) and info.get("finish") != "tool-calls"
+
+
+def test_telemetry_marks_session_finished_only_when_agent_ends() -> None:
+    client = FakeClient()
+    telemetry = AgentisTelemetry(task_id="task-1", prompt="x", adapter="claude", client=client, run_id="run-1")
+    usage = {"usage": {"input_tokens": 1}, "cost_usd": None}
+
+    telemetry.start()
+    for event in [
+        AgentEvent("session", {"session_id": "ses_1", "model": "m", "cwd": "/w"}),
+        AgentEvent("step", usage),
+        AgentEvent("tool", {"id": "t1", "name": "Read", "status": "running", "input": {"file_path": "/a"}}),
+        AgentEvent("tool", {"id": "t1", "status": "completed", "output": "data"}),
+        AgentEvent("step", usage),
+        AgentEvent("tool", {"id": "t2", "name": "StructuredOutput", "status": "running", "input": {"a": 1}}),
+        AgentEvent("tool", {"id": "t2", "status": "completed", "output": "ok"}),
+        AgentEvent("result", {"session_id": "ses_1", "usage": {"input_tokens": 2}, "is_error": False}),
+    ]:
+        telemetry.handle(event)
+
+    snapshots = [c["params"]["messages"] for c in client.calls if c["method"] == "session.store_activity_log"]
+    assert snapshots
+    assert not any(_is_session_finished(snapshot) for snapshot in snapshots)
+
+    telemetry.finish()
+
+    final = next(c["params"]["messages"] for c in reversed(client.calls) if c["method"] == "session.store_activity_log")
+    assert _is_session_finished(final)
+    # koncová značka je jen na poslední zprávě, mezikroky dál hlásí pokračování
+    assert [m["info"].get("finish") for m in final if m["info"]["role"] == "assistant"] == [
+        "tool-calls",
+        "tool-calls",
+        "stop",
+    ]

@@ -40,6 +40,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agentiscode.core import AgentConfig, AgentEvent, AgentWrapper, normalize_adapter
 from agentiscode.output_schema import OutputSchema, OutputSchemaError
+from agentiscode.procutil import kill_tree, signal_group
 from agentiscode.proctree import become_subreaper, die_with_parent, terminate_descendants
 from agentiscode.telemetry import AgentisTelemetry
 
@@ -568,17 +569,11 @@ def _log_schema_errors(message: str, errors: Sequence[str]) -> None:
 
 
 def _kill(proc: Optional[asyncio.subprocess.Process]) -> None:
-    _signal_group(proc, signal.SIGKILL)
+    kill_tree(proc)
 
 
 def _signal_group(proc: Optional[asyncio.subprocess.Process], signum: int) -> None:
-    if proc is None or proc.returncode is not None:
-        return
-    with contextlib.suppress(Exception):
-        os.killpg(os.getpgid(proc.pid), signum)
-        return
-    with contextlib.suppress(Exception):
-        proc.send_signal(signum)
+    signal_group(proc, signum)
 
 
 def run(argv: Optional[Sequence[str]] = None) -> int:

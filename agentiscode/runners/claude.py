@@ -26,13 +26,13 @@ import contextlib
 import json
 import os
 import signal
-import shlex
 import sys
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
 
 import asyncio
 
+from agentiscode.procutil import command_argv, kill_tree, spawn_kwargs
 from agentiscode.stream_reader import unbounded_line_reader as _unbounded_line_reader
 
 
@@ -189,15 +189,9 @@ class ClaudeCodeClient:
         """Tvrdě ukončí běžící claude proces (a jeho potomky)."""
         if proc.returncode is not None:
             return
-        # Proces má vlastní session/process group (start_new_session),
-        # killneme celou skupinu, ať jdou dolů i potomci claude CLI.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            return
-        except (ProcessLookupError, OSError):
-            pass
-        with contextlib.suppress(Exception):
-            proc.kill()
+        # Proces má vlastní session/process group, killneme celý strom,
+        # ať jdou dolů i potomci claude CLI.
+        kill_tree(proc)
 
     # -- veřejné API -------------------------------------------------------
 
@@ -231,18 +225,14 @@ class ClaudeCodeClient:
         env = {**os.environ, **cfg.env}
         args = cfg.build_args()
 
-        local_command = "exec " + shlex.join([cfg.command, *args])
         proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-c",
-            local_command,
+            *command_argv(cfg.command, args),
             cwd=cfg.cwd,
             env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            preexec_fn=_set_parent_death_signal,
+            **spawn_kwargs(_set_parent_death_signal),
         )
 
         if on_proc_started is not None:
