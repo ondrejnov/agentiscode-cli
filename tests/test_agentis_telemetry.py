@@ -85,7 +85,12 @@ def test_telemetry_full_run_creates_run_binds_session_and_pushes_logs() -> None:
     # session binding proběhne při session eventu, před prvním store_activity_log
     assert "run.store_session_id" in methods
     assert methods.index("run.store_session_id") < methods.index("session.store_activity_log")
-    assert client.params_for("run.store_session_id") == {"run_id": "run-9", "session_id": "ses_1", "primary": True}
+    assert client.params_for("run.store_session_id") == {
+        "run_id": "run-9",
+        "session_id": "ses_1",
+        "primary": True,
+        "model": "claude-x",
+    }
 
     adapter_events = [c["params"] for c in client.calls if c["method"] == "run.adapter_event"]
     # běh spuštěn — agentiscode krok se posílá rovnou jako success (bez started spinneru)
@@ -213,6 +218,49 @@ def test_telemetry_binds_title_and_parent_only_to_own_session() -> None:
         },
         {"run_id": "run-existing", "session_id": "ses-nested", "primary": False},
     ]
+
+
+def test_telemetry_binds_model_and_effort_to_own_session() -> None:
+    client = FakeClient()
+    telemetry = AgentisTelemetry(
+        task_id="task-1",
+        prompt="udelej X",
+        adapter="claude",
+        run_id="run-existing",
+        primary_session=False,
+        model="opus",
+        effort="high",
+        client=client,
+    )
+
+    telemetry.start()
+    telemetry.handle(AgentEvent("session", {"session_id": "ses-agent", "model": "claude-opus-5-5"}))
+    telemetry.handle(AgentEvent("session", {"session_id": "ses-nested", "model": "claude-haiku-5-5"}))
+
+    bindings = [call["params"] for call in client.calls if call["method"] == "run.store_session_id"]
+    assert bindings == [
+        {
+            "run_id": "run-existing",
+            "session_id": "ses-agent",
+            "primary": False,
+            "model": "claude-opus-5-5",
+            "effort": "high",
+        },
+        {"run_id": "run-existing", "session_id": "ses-nested", "primary": False},
+    ]
+
+
+def test_telemetry_binds_configured_model_when_session_event_has_none() -> None:
+    client = FakeClient()
+    telemetry = AgentisTelemetry(
+        task_id="task-1", prompt="udelej X", adapter="claude", run_id="run-existing", model="sonnet", client=client
+    )
+
+    telemetry.start()
+    telemetry.handle(AgentEvent("session", {"session_id": "ses-agent"}))
+
+    assert client.params_for("run.store_session_id")["model"] == "sonnet"
+    assert "effort" not in client.params_for("run.store_session_id")
 
 
 def test_telemetry_stores_subagent_messages_under_its_own_session() -> None:

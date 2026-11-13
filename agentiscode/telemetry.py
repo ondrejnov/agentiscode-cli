@@ -38,6 +38,7 @@ class _SessionTelemetryState:
     bound: bool = False
     dirty: bool = False
     step_seen: bool = False
+    model: Optional[str] = None
 
 
 def _unified_to_native(event: AgentEvent) -> Optional[ClaudeEvent]:
@@ -121,6 +122,8 @@ class AgentisTelemetry:
         primary_session: bool = True,
         session_title: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
         endpoint: Optional[str] = None,
         token: Optional[str] = None,
         service_token: Optional[str] = None,
@@ -142,6 +145,8 @@ class AgentisTelemetry:
         self.primary_session = primary_session
         self.session_title = (session_title or "").strip() or None
         self.parent_session_id = (parent_session_id or "").strip() or None
+        self.model = (model or "").strip() or None
+        self.effort = (effort or "").strip() or None
         self._on_error = on_error or (lambda message: None)
 
         self._client = client
@@ -218,6 +223,8 @@ class AgentisTelemetry:
                     session_id_hint=event_session_id,
                 )
             )
+            if isinstance(event.data.get("model"), str):
+                state.model = event.data["model"].strip() or None
             self._sessions[event_session_id] = state
             if is_primary:
                 self.session_id = event_session_id
@@ -341,6 +348,11 @@ class AgentisTelemetry:
                 params["title"] = self.session_title
             if self.parent_session_id:
                 params["parent_session_id"] = self.parent_session_id
+            # skutečný model z init eventu má přednost před aliasem z CLI (např. `opus`)
+            if state.model or self.model:
+                params["model"] = state.model or self.model
+            if self.effort:
+                params["effort"] = self.effort
         state.bound = self._call_succeeded("run.store_session_id", params)
         if state.bound and state.dirty:
             self._push_activity_log(session_id, state)
